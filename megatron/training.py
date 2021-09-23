@@ -55,6 +55,9 @@ from megatron.global_vars import codecarbon_tracker_start, codecarbon_tracker_st
 
 import deepspeed
 
+# SCR: import scalable checkpoint/restart library
+import scr
+
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -166,6 +169,10 @@ def pretrain(train_valid_test_dataset_provider,
                                    0, True)
 
     codecarbon_tracker_stop()
+
+    # SCR: flush any cached checkpoint
+    if args.scr:
+        scr.finalize()
 
 
 def update_train_iters(args):
@@ -730,6 +737,31 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                      lr_scheduler)
             saved_checkpoint = True
 
+        # SCR: Take a defensive checkpoint if it's time
+        if args.save and args.scr and args.scr_interval and \
+            iteration % args.scr_interval == 0:
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         lr_scheduler)
+                saved_checkpoint = True
+
+        # SCR: Take a defensive checkpoint if SCR recommends its
+        if args.save and args.scr and scr.need_checkpoint():
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         lr_scheduler)
+                saved_checkpoint = True
+
+        # SCR: Save checkpiont and exit run if SCR recommends its
+        #if args.save and args.scr and scr.should_exit():
+        #    if not saved_checkpoint:
+        #        save_checkpoint_and_time(iteration, model, optimizer,
+        #                                 lr_scheduler)
+        #    torch.distributed.barrier()
+        #    print_datetime('exiting program at iteration {}'.format(iteration))
+        #    scr.finalize()
+        #    sys.exit()
+
         # Exiting based on duration
         if args.exit_duration_in_mins:
             train_time = (time.time() - _TRAIN_START_TIME) / 60.0
@@ -743,6 +775,11 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              lr_scheduler)
                 print_datetime('exiting program after {} minutes'.format(train_time))
+
+                # SCR: finalize to flush any cached checkpoint
+                if args.scr:
+                    scr.finalize()
+
                 sys.exit()
 
         # Exiting based on iterations
@@ -752,6 +789,11 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                          lr_scheduler)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
+
+            # SCR: finalize to flush any cached checkpoint
+            if args.scr:
+                scr.finalize()
+
             sys.exit()
 
 
