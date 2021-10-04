@@ -69,7 +69,8 @@ from indexed_json import IndexedJSON
 
 from megatron.tokenizer import build_tokenizer
 from megatron.data.indexed_dataset import data_file_path, index_file_path, make_builder, best_fitting_dtype, gather_files_dist
-from megatron.data.distdata import DistData
+#from megatron.data.distdata import DistData
+from megatron.data.distdata_mpi import DistData
 
 def msg(msg, flush=False):
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -193,7 +194,7 @@ def get_args():
     args.keep_empty = False
 
     # initialize our distributed environment
-    args.distctx = DistData(backend=args.torch_backend)
+    args.distctx = DistData(backend=args.torch_backend, use_mpi4py=True)
 
     # some functions like build_tokenizer use args.rank to filter stdout messages
     args.rank = args.distctx.rank
