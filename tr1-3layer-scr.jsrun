@@ -1,0 +1,202 @@
+#!/bin/bash
+
+source /usr/WS2/moody20/projects/Megatron-DeepSpeed.git/examples/llnlenv.sh
+
+# Install SCR into python environment
+#pushd /g/g0/moody20/packages/scr/dist/scr-lassen/scr-top-develop/install/share/scr/python
+#python setup.py install
+#popd
+#exit 0
+
+export SCR_DEBUG=1
+export SCR_CACHE_BYPASS=0
+export SCR_COPY_TYPE=SINGLE
+
+#conda install psutil
+#exit 0
+
+set -x -e
+
+#source $six_ALL_CCFRWORK/code/tr1-13B/bigscience/train/tr1-13B-base/start-tr1-13B
+
+echo "START TIME: $(date)"
+
+DATA_OUTPUT_PATH=${CKPTDIR}/tr1-3layer
+CHECKPOINT_PATH=$DATA_OUTPUT_PATH/checkpoints
+TENSORBOARD_PATH=$DATA_OUTPUT_PATH/tensorboard
+CODECARBON_PATH=$DATA_OUTPUT_PATH/codecarbon
+LOGS_PATH=$DATA_OUTPUT_PATH/logs
+
+MEGATRON_DEEPSPEED_REPO=$NFSDIR
+
+VOCAB_FILE=${DATADIR}/openwebtext/gpt2-vocab.json
+MERGE_FILE=${DATADIR}/openwebtext/gpt2-merges.txt
+DATA_PATH=${DATADIR}/openwebtext/oscar-shuf-eod-gpt2bpe_text_document
+
+cd $MEGATRON_DEEPSPEED_REPO
+
+GPUS_PER_NODE=4
+NNODES=64    # switch to 64
+TP_SIZE=4    # always fixed to the size of a single node
+PP_SIZE=4    # NLAYERS must be a multiple of PP_SIZE here
+#DP_SIZE=$NNODES*$GPUS_PER_NODE/($PP_SIZE*$TP_SIZE) # will get derived automatically by trainer
+
+# GLOBAL_BATCH_SIZE has to be divisible by MICRO_BATCH_SIZE*DP_size
+# GLOBAL_BATCH_SIZE=$(($MICRO_BATCH_SIZE*$GAS*$DP_SIZE)) - GAS is auto-derived by deepspeed
+MICRO_BATCH_SIZE=1
+GLOBAL_BATCH_SIZE=1536
+
+NLAYERS=4
+NHIDDEN=10752
+#NHIDDEN=5120
+NHEADS=84
+#NHEADS=40
+FFN_HIDDEN_SIZE=$(($NHIDDEN * 4))
+SEQ_LEN=2048
+VOCAB_SIZE=50257
+
+SAVE_INTERVAL=20
+
+OPTIMIZER_ARGS=" \
+    --optimizer adam \
+    --adam-beta1 0.9 \
+    --adam-beta2 0.95 \
+    --adam-eps 1e-8 \
+    --lr 6.0e-5 \
+    --min-lr 6.0e-6 \
+    --lr-decay-style cosine \
+    --lr-decay-samples 126_953_125 \
+    --lr-warmup-samples 183_105 \
+    --clip-grad 1.0 \
+    --weight-decay 1e-1 \
+    --init-method-std 0.006 \
+    "
+
+EXIT_OPTS=" \
+    --exit-duration-in-mins 10 \
+    "
+
+GPT_ARGS=" \
+    --num-layers $NLAYERS \
+    --hidden-size $NHIDDEN \
+    --ffn-hidden-size $FFN_HIDDEN_SIZE \
+    --num-attention-heads $NHEADS \
+    --seq-length $SEQ_LEN \
+    --max-position-embeddings $SEQ_LEN \
+    --micro-batch-size $MICRO_BATCH_SIZE \
+    --rampup-batch-size 16 16 5_859_375 \
+    --global-batch-size $GLOBAL_BATCH_SIZE \
+    --train-samples 146_484_375 \
+    --vocab-file $VOCAB_FILE \
+    --merge-file $MERGE_FILE \
+    --loss-scale 12 \
+    --fp16 \
+    --checkpoint-activations \
+    --seed 42
+    $OPTIMIZER_ARGS \
+    $EXIT_OPTS \
+    "
+
+# codecarbon isn't ready, will enable once it's working
+#    --codecarbon-dir $CODECARBON_PATH \
+OUTPUT_ARGS=" \
+    --log-interval 10 \
+    --save-interval $SAVE_INTERVAL \
+    --eval-interval 1000 \
+    --eval-iters 40 \
+    --tensorboard-dir $TENSORBOARD_PATH \
+    --tensorboard-queue-size 5 \
+    --log-timers-to-tensorboard \
+    --log-batch-size-to-tensorboard \
+    --log-validation-ppl-to-tensorboard \
+    "
+
+ZERO_STAGE=1
+#ZERO_STAGE=3
+
+#config_json="./ds_config.$SLURM_JOBID.json"
+config_json="./ds_config.$LSB_JOBID.json"
+
+#  "zero_optimization": {
+#    "stage": $ZERO_STAGE
+#  },
+#  "zero_optimization": {
+#    "stage": $ZERO_STAGE,
+#    "offload_optimizer": {
+#        "device": "cpu"
+#    },
+#    "offload_param": {
+#        "device": "cpu"
+#    }
+#  },
+# Deepspeed figures out GAS dynamically from dynamic GBS via set_train_batch_size()
+cat <<EOT > $config_json
+{
+  "train_micro_batch_size_per_gpu": $MICRO_BATCH_SIZE,
+  "train_batch_size": $GLOBAL_BATCH_SIZE,
+  "gradient_clipping": 1.0,
+  "zero_optimization": {
+    "stage": $ZERO_STAGE
+  },
+  "fp16": {
+    "enabled": true,
+    "loss_scale": 0,
+    "loss_scale_window": 500,
+    "hysteresis": 2,
+    "min_loss_scale": 1,
+    "initial_scale_power": 12
+  },
+  "steps_per_print": 2000,
+  "wall_clock_breakdown": false
+}
+EOT
+
+
+# to use offload, add the following to deepspeed config json
+#  "zero_optimization": {
+#    "stage": $ZERO_STAGE,
+#    "offload_optimizer": {
+#        "device": "cpu"
+#    },
+#    "offload_param": {
+#        "device": "cpu"
+#    }
+#  },
+# and set --cpu-optimizer in deepspeed args
+# however, it cannot currently be used with megatron:
+#   https://github.com/microsoft/Megatron-DeepSpeed/blob/1a74a0513441cf4cc6444ada028fee2bc335b236/megatron/optimizer/__init__.py#L54
+
+DEEPSPEED_ARGS=" \
+    --deepspeed \
+    --deepspeed_config ${config_json} \
+    --zero-stage ${ZERO_STAGE} \
+    --deepspeed-activation-checkpointing \
+    "
+
+export CMD=" \
+    `pwd`/pretrain_gpt_scr.py \
+    --tensor-model-parallel-size $TP_SIZE \
+    --pipeline-model-parallel-size $PP_SIZE \
+    $GPT_ARGS \
+    $OUTPUT_ARGS \
+    --save $CHECKPOINT_PATH \
+    --load $CHECKPOINT_PATH \
+    --data-path $DATA_PATH \
+    --data-impl mmap \
+    --split 949,50,1 \
+    --distributed-backend nccl \
+     $DEEPSPEED_ARGS \
+    "
+
+echo $CMD
+
+#If the trainer hangs in compiling and loading fused kernels it means it dropped a lock file, delete it and restart:
+rm -f ./megatron/fused_kernels/build/lock
+sleep 2
+
+#export NCCL_DEBUG=INFO
+jsrun --stdio_mode prepended --bind=none -r 4 -c 10 python3 $CMD
+
+echo "END TIME: $(date)"
+
+#
