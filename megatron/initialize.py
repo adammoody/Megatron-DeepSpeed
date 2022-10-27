@@ -65,6 +65,31 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         _set_random_seed(args.seed)
 
     args = get_args()
+
+    # SCR: point SCR_PREFIX to checkpoint path
+    if args.scr:
+        # SCR only supports a single directory to both read previous checkpoints and to write new checkpoints
+        if args.save != args.load:
+            raise ValueError(f"--save {args.save} must match --load {args.load} when using SCR")
+
+        # SCR will default to use the current working dir if args.save not specified
+        if args.save is not None:
+            scr.config(f"SCR_PREFIX={args.save}")
+
+        # DeepSpeed expects files to be on global file system
+        # This will flush any cached checkpoint to the file system on restart
+        scr.config("SCR_GLOBAL_RESTART=1")
+
+        # Configure seconds between checkpoints if user provided a limit.
+        if args.scr_seconds is not None:
+            scr.config(f"SCR_CHECKPOINT_SECONDS={args.scr_seconds}")
+
+        # Configure max percentage of runtime for checkpointing if user provided a limit.
+        if args.scr_overhead is not None:
+            scr.config(f"SCR_CHECKPOINT_OVERHEAD={args.scr_overhead}")
+
+        scr.init()
+
     if  args.lazy_mpu_init:
         args.use_cpu_initialization=True
         # delayed initialization of DDP-related stuff
@@ -89,6 +114,9 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
 
         # No continuation function
         return None
+
+from mpi4py import MPI
+import scr
 
 
 def _compile_dependencies():
@@ -211,7 +239,8 @@ def _initialize_distributed():
             get_accelerator().set_device(device) # only do so when device_count > 0
 
         # Call the init process
-        init_method = 'tcp://'
+        #init_method = 'tcp://'
+        init_method = 'env://'
         master_ip = os.getenv('MASTER_ADDR', 'localhost')
         master_port = os.getenv('MASTER_PORT', '6000')
         init_method += master_ip + ':' + master_port

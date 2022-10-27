@@ -594,6 +594,15 @@ def _add_checkpointing_args(parser):
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
 
+    group.add_argument('--scr', action='store_true', default=None,
+                       help='Enable SCR for checkpointing.')
+    group.add_argument('--scr-interval', type=int, default=None,
+                       help='Number of iterations between defensive checkpoints.')
+    group.add_argument('--scr-seconds', type=float, default=None,
+                       help='Number of seconds between defensive checkpoints.')
+    group.add_argument('--scr-overhead', type=float, default=None,
+                       help='Maximum runtime percentage for defensive checkpoints.')
+
     return parser
 
 

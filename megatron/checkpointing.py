@@ -119,6 +119,10 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
         iteration, args.save))
 
+    # SCR: the call to start output lives in DeepSpeed right now
+    #if args.scr:
+    #    scr.start_output(checkpoint_name, scr.FLAG_CHECKPOINT)
+
     if not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0 \
         or args.deepspeed:
 
