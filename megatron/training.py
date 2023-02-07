@@ -1148,14 +1148,14 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         # to the application that it should exit when it is close to its time limit.
         # This can also react to external commands from the user, like an scr_halt command.
         #
-        #if args.save and args.scr and scr.should_exit():
-        #    if not saved_checkpoint:
-        #        save_checkpoint_and_time(iteration, model, optimizer,
-        #                                 lr_scheduler)
-        #    torch.distributed.barrier()
-        #    print_datetime('exiting program at iteration {}'.format(iteration))
-        #    scr.finalize()
-        #    sys.exit()
+        if args.save and args.scr and scr.should_exit():
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         lr_scheduler)
+            torch.distributed.barrier()
+            print_datetime('exiting program due to scr.should_exit at iteration {}'.format(iteration))
+            scr.finalize()
+            sys.exit()
 
         # Exiting based on duration
         if args.exit_duration_in_mins:
