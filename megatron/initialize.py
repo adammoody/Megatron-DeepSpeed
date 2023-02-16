@@ -80,6 +80,11 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # This will flush any cached checkpoint to the file system on restart
         scr.config("SCR_GLOBAL_RESTART=1")
 
+        # Allow user to name a specific checkpoint to load.
+        # This should match the name that was given to SCR, which is the checkpoint tag.
+        if args.scr_current is not None:
+            scr.config(f"SCR_CURRENT={args.scr_current}")
+
         # Configure seconds between checkpoints if user provided a limit.
         if args.scr_seconds is not None:
             scr.config(f"SCR_CHECKPOINT_SECONDS={args.scr_seconds}")

@@ -602,6 +602,8 @@ def _add_checkpointing_args(parser):
                        help='Number of seconds between defensive checkpoints.')
     group.add_argument('--scr-overhead', type=float, default=None,
                        help='Maximum runtime percentage for defensive checkpoints.')
+    group.add_argument('--scr-current', type=str, default=None,
+                       help='Checkpoint tag to load, e.g., global_step128.')
 
     return parser
 
