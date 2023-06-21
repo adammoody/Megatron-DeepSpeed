@@ -29,6 +29,7 @@ from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 from torch import distributed as dist
 import deepspeed
 from deepspeed.moe.layer import MoE
+from deepspeed.accelerator import get_accelerator
 # flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -275,7 +276,7 @@ class ParallelAttention(MegatronModule):
             output_size[2],
             output_size[3],
             dtype=query_layer.dtype,
-            device=torch.cuda.current_device())
+            device=get_accelerator().current_device_name())
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
@@ -464,7 +465,7 @@ class ParallelTransformerLayer(MegatronModule):
                             drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel,
                             enable_expert_tensor_parallelism=enable_expert_tensor_parallelism) 
 
-    def forward(self, hidden_states, attention_mask,
+    def forward(self, hidden_states, attention_mask=None,
                 encoder_output=None, enc_dec_attn_mask=None,
                 layer_past=None, get_key_value=False):
         # hidden_states: [b, s, h]
@@ -706,7 +707,7 @@ class ParallelTransformer(MegatronModule):
                 moe_losses = []
                 for index in range(start, end):
                     layer = self._get_layer(index)
-                    x_, moe_loss = layer(x_, attention_mask, encoder_output, enc_dec_attn_mask)
+                    x_, moe_loss = layer(x_, attention_mask=attention_mask, encoder_output=encoder_output, enc_dec_attn_mask=enc_dec_attn_mask)
                     moe_losses.append(moe_loss)
                 return (x_, *moe_losses)
             return custom_forward
@@ -779,7 +780,7 @@ class ParallelTransformer(MegatronModule):
                 if layer_past is not None:
                     past = layer_past[index]
                 hidden_states = layer(hidden_states,
-                                      attention_mask,
+                                      attention_mask=attention_mask,
                                       encoder_output=encoder_output,
                                       enc_dec_attn_mask=enc_dec_attn_mask,
                                       layer_past=past,

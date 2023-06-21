@@ -20,8 +20,10 @@ import sys
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
 
-from apex.multi_tensor_apply import multi_tensor_applier
-import amp_C
+from deepspeed.accelerator import get_accelerator
+if get_accelerator().device_name() == 'cuda':
+    from apex.multi_tensor_apply import multi_tensor_applier
+    import amp_C
 
 from megatron import get_args
 from megatron import print_rank_0
@@ -30,7 +32,7 @@ from megatron import mpu
 from megatron.model.module import param_is_not_shared
 from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 from megatron import get_num_microbatches
-
+from deepspeed.accelerator import get_accelerator
 def unwrap_model(model, module_instances=(torchDDP)):
     return_list = True
     if not isinstance(model, list):
@@ -63,13 +65,18 @@ def calc_params_l2_norm(model):
                 else:
                     params_data.append(param.data)
     # Calculate norm
-    dummy_overflow_buf = torch.cuda.IntTensor([0])
-    norm, _ = multi_tensor_applier(
-        amp_C.multi_tensor_l2norm,
-        dummy_overflow_buf,
-        [params_data],
-        False # no per-parameter norm
-    )
+    dummy_overflow_buf = get_accelerator().IntTensor([0])
+    
+    if get_accelerator().device_name() == 'cuda':
+
+        norm, _ = multi_tensor_applier(
+            amp_C.multi_tensor_l2norm,
+            dummy_overflow_buf,
+            [params_data],
+            False # no per-parameter norm
+        )
+    else :
+        norm = torch.norm(params_data,p=2.0)
     norm_2 = norm * norm
     # Sum across all model-parallel GPUs.
     torch.distributed.all_reduce(norm_2,
@@ -95,13 +102,13 @@ def report_memory(name):
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
     string += ' | allocated: {}'.format(
-        torch.cuda.memory_allocated() / mega_bytes)
+        get_accelerator().memory_allocated() / mega_bytes)
     string += ' | max allocated: {}'.format(
-        torch.cuda.max_memory_allocated() / mega_bytes)
+        get_accelerator().max_memory_allocated() / mega_bytes)
     string += ' | reserved: {}'.format(
-        torch.cuda.memory_reserved() / mega_bytes)
+        get_accelerator().memory_reserved() / mega_bytes)
     string += ' | max reserved: {}'.format(
-        torch.cuda.max_memory_reserved() / mega_bytes)
+        get_accelerator().max_memory_reserved() / mega_bytes)
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string),
               flush=True)
@@ -231,7 +238,10 @@ def throughput_calculator(model, args, iteration_time, total_iterations):
     # The factor of 4 is when used with activation check-pointing,
     # otherwise it will be 3.
     checkpoint_activations_factor = 4 if args.checkpoint_activations else 3
-    flops_per_iteration = (24 * checkpoint_activations_factor * batch_size * args.seq_length * num_layers * (hidden_size**2)) * (1. + (args.seq_length / (6. * hidden_size)) + (vocab_size / (16. * num_layers * hidden_size)))
+    seq_len = args.seq_length
+    if hasattr(args, 'actual_seq_length'):
+        seq_len = args.actual_seq_length
+    flops_per_iteration = (24 * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (1. + (seq_len / (6. * hidden_size)) + (vocab_size / (16. * num_layers * hidden_size)))
     tflops = flops_per_iteration / (elapsed_time_per_iter * args.world_size * (10**12))
     return samples_per_second, tflops, approx_parameters_in_billions
 

@@ -248,7 +248,7 @@ def parse_args(extra_args_provider=None, defaults={},
             'for distribute-checkpointed-activations to work you '\
             'need to enable checkpoint-activations'
 
-    args.curriculum_learning = False
+    args.curriculum_learning_legacy = False
     args.compression_training = False
 
     # AML
@@ -444,6 +444,9 @@ def _add_training_args(parser):
     group.add_argument('--train-tokens', type=int, default=None,
                        help='Total number of tokens to train over all '
                        'training runs.')
+    group.add_argument('--random-ltd',
+                       action='store_true',
+                       help='enable random layer token drop')    
     group.add_argument('--log-interval', type=int, default=100,
                        help='Report loss and timing interval.')
     group.add_argument('--exit-interval', type=int, default=None,
@@ -591,6 +594,17 @@ def _add_checkpointing_args(parser):
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
 
+    group.add_argument('--scr', action='store_true', default=None,
+                       help='Enable SCR for checkpointing.')
+    group.add_argument('--scr-interval', type=int, default=None,
+                       help='Number of iterations between defensive checkpoints.')
+    group.add_argument('--scr-seconds', type=float, default=None,
+                       help='Number of seconds between defensive checkpoints.')
+    group.add_argument('--scr-overhead', type=float, default=None,
+                       help='Maximum runtime percentage for defensive checkpoints.')
+    group.add_argument('--scr-current', type=str, default=None,
+                       help='Checkpoint tag to load, e.g., global_step128.')
+
     return parser
 
 
@@ -650,7 +664,7 @@ def _add_distributed_args(parser):
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
     group.add_argument('--distributed-backend', default='nccl',
-                       choices=['nccl', 'gloo'],
+                       choices=['nccl', 'gloo', 'ccl'],
                        help='Which backend to use for distributed training.')
     group.add_argument('--DDP-impl', default='local',
                        choices=['local', 'torch'],
@@ -748,7 +762,21 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
-
+    group.add_argument('--train-data-exact-num-epochs', type=int, default=None,
+                       help='When building the train dataset, force it to be '
+                       'an exact number of epochs of the raw data')
+    group.add_argument('--return-data-index', action='store_true',
+                       help='Return the index of data sample.')
+    group.add_argument('--data-efficiency-curriculum-learning', action='store_true',
+                       help='Use DeepSpeed data efficiency library curriculum learning feature.')
+    group.add_argument('--train-idx-path', type=str, default=None,
+                       help='Force to use certain index file.')
+    group.add_argument('--train-doc-idx-path', type=str, default=None,
+                       help='Force to use certain index file.')
+    group.add_argument('--train-sample-idx-path', type=str, default=None,
+                       help='Force to use certain index file.')
+    group.add_argument('--train-shuffle-idx-path', type=str, default=None,
+                       help='Force to use certain index file.')
     return parser
 
 

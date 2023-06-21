@@ -52,11 +52,15 @@ from megatron.schedules import forward_backward_no_pipelining
 from megatron.schedules import forward_backward_pipelining_without_interleaving
 from megatron.schedules import forward_backward_pipelining_with_interleaving
 from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator
-
+from deepspeed.accelerator import get_accelerator
 import deepspeed
 from deepspeed.compression.compress import init_compression, redundancy_clean
 
+# SCR: import scalable checkpoint/restart library
+import scr
 
+from megatron.model.transformer import  ParallelTransformerLayer
+from deepspeed.runtime.data_pipeline.data_routing.helper import convert_to_random_ltd
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -69,7 +73,8 @@ def pretrain(train_valid_test_dataset_provider,
              model_provider,
              forward_step_func,
              extra_args_provider=None,
-             args_defaults={}):
+             args_defaults={},
+             data_post_process=None):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -102,7 +107,7 @@ def pretrain(train_valid_test_dataset_provider,
     # This will be closer to what scheduler will see (outside of
     # image ... launches.
     global _TRAIN_START_TIME
-    start_time_tensor = torch.cuda.FloatTensor([_TRAIN_START_TIME])
+    start_time_tensor = get_accelerator().FloatTensor([_TRAIN_START_TIME])
     torch.distributed.all_reduce(start_time_tensor,
                                  op=torch.distributed.ReduceOp.MIN)
     _TRAIN_START_TIME = start_time_tensor.item()
@@ -118,9 +123,9 @@ def pretrain(train_valid_test_dataset_provider,
             open(args.deepspeed_config, 'r', encoding='utf-8'))
         if "curriculum_learning" in args.deepspeed_configuration and \
             "enabled" in args.deepspeed_configuration["curriculum_learning"]:
-            args.curriculum_learning = args.deepspeed_configuration[ \
+            args.curriculum_learning_legacy = args.deepspeed_configuration[ \
                 "curriculum_learning"]["enabled"]
-        if args.curriculum_learning and not args.no_pipeline_parallel:
+        if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
             from deepspeed.runtime.data_pipeline.curriculum_scheduler \
                 import CurriculumScheduler
             args.curriculum_scheduler = CurriculumScheduler( \
@@ -130,7 +135,9 @@ def pretrain(train_valid_test_dataset_provider,
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup').start()
-    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider, teacher=False)
+    model, optimizer, lr_scheduler = setup_model_and_optimizer(
+        model_provider, teacher=False, data_post_process=data_post_process,
+        build_train_valid_test_datasets_provider=train_valid_test_dataset_provider)
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
@@ -149,6 +156,18 @@ def pretrain(train_valid_test_dataset_provider,
         train_data_iterator, valid_data_iterator, test_data_iterator \
             = build_train_valid_test_data_iterators(
                 train_valid_test_dataset_provider)
+    if args.data_efficiency_curriculum_learning:
+        if args.deepspeed_dataloader is not None:
+            # We use args to pass the deepspeed_dataloader because adding
+            # output to setup_model_and_optimizer will break the API for other
+            # cases. We clear args.deepspeed_dataloader after updating
+            # train_data_iterator because args will be saved in checkpoint and
+            # attempting to save the whole deepspeed_dataloader will lead to
+            # "AttributeError: Can't pickle local object...".
+            train_data_iterator = iter(args.deepspeed_dataloader)
+            args.deepspeed_dataloader = None
+        else:
+            train_data_iterator = None
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
 
@@ -187,6 +206,9 @@ def pretrain(train_valid_test_dataset_provider,
                                     valid_data_iterator, model,
                                     iteration, False)
 
+    # SCR: flush any cached checkpoint
+    if args.scr:
+        scr.finalize()
 
     if args.save and iteration != 0:
         save_checkpoint(iteration, model, optimizer, lr_scheduler)
@@ -309,14 +331,15 @@ def get_model(model_provider_func):
 
     # GPU allocation.
     for model_module in model:
-        model_module.cuda(torch.cuda.current_device())
+        model_module.to(get_accelerator().current_device_name())
+ 
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
         model = [Float16Module(model_module, args) for model_module in model]
 
     if args.DDP_impl == 'torch':
-        i = torch.cuda.current_device()
+        i = get_accelerator().current_device()
         model = [torchDDP(model_module, device_ids=[i], output_device=i,
                           process_group=mpu.get_data_parallel_group())
                  for model_module in model]
@@ -411,7 +434,8 @@ def load_model_weights_only(model_provider_func):
 
     return model, optimizer, lr_scheduler
 
-def setup_model_and_optimizer(model_provider_func, teacher=False):
+def setup_model_and_optimizer(model_provider_func, teacher=False,
+    data_post_process=None, build_train_valid_test_datasets_provider=None):
     """Setup model and optimizer."""
     args = get_args()
 
@@ -461,13 +485,48 @@ def setup_model_and_optimizer(model_provider_func, teacher=False):
     if args.deepspeed:
         print_rank_0("DeepSpeed is enabled.")
         pp = mpu.get_pipeline_model_parallel_world_size()
-        model, optimizer, _, lr_scheduler = deepspeed.initialize(
-            model=model[0],
-            optimizer=optimizer,
-            args=args,
-            lr_scheduler=lr_scheduler,
-            mpu=mpu if args.no_pipeline_parallel else None
-        )
+        if args.data_efficiency_curriculum_learning and build_train_valid_test_datasets_provider is not None:
+            train_ds = None
+            # Only need to build dataset on tp rank 0 since Megatron has the
+            # broadcast_data() function that broadcast data from tp rank 0.
+            if mpu.get_tensor_model_parallel_rank() == 0:
+                # Number of train/valid/test samples.
+                if args.train_samples:
+                    train_samples = args.train_samples
+                    update_train_iters(args)
+                else:
+                    train_samples = args.train_iters * args.global_batch_size
+                # eval_iters and test_iters here are not actually used, only for
+                # satisfying the input of build_train_valid_test_datasets_provider.
+                # We only need to build the training data here. And we follow
+                # baseline's logic to build eval/test dataset later in
+                # build_train_valid_test_data_iterators.
+                eval_iters = (args.train_iters // args.eval_interval + 1) * \
+                            args.eval_iters
+                test_iters = args.eval_iters
+                train_val_test_num_samples = [train_samples,
+                                            eval_iters * args.global_batch_size,
+                                            test_iters * args.global_batch_size]
+                # Build the datasets.
+                train_ds, _, _ = build_train_valid_test_datasets_provider(
+                    train_val_test_num_samples)
+            model, optimizer, args.deepspeed_dataloader, lr_scheduler = deepspeed.initialize(
+                model=model[0],
+                optimizer=optimizer,
+                args=args,
+                lr_scheduler=lr_scheduler,
+                training_data=train_ds,
+                mpu=mpu if args.no_pipeline_parallel else None
+            )
+            model.set_data_post_process_func(data_post_process)
+        else:
+            model, optimizer, _, lr_scheduler = deepspeed.initialize(
+                model=model[0],
+                optimizer=optimizer,
+                args=args,
+                lr_scheduler=lr_scheduler,
+                mpu=mpu if args.no_pipeline_parallel else None
+            )
         if isinstance(model, deepspeed.PipelineEngine):
             # hack to get batch_fn from pretrain_gpt.py
             model.set_batch_fn(model.module._megatron_batch_fn)
@@ -506,6 +565,10 @@ def setup_model_and_optimizer(model_provider_func, teacher=False):
         unwrapped_model[0].init_state_dict_from_bert()
         if args.fp16:
             optimizer.reload_model_params()
+
+    # random-LTD requires converting transformer layers
+    if args.random_ltd:
+        model[0] = convert_to_random_ltd(model[0], ParallelTransformerLayer)
 
     return model, optimizer, lr_scheduler
 
@@ -656,7 +719,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     for key in loss_dict:
         if not skipped_iter:
             total_loss_dict[key] = total_loss_dict.get(
-                key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
+                key, get_accelerator().FloatTensor([0.0])) + loss_dict[key]
         else:
             value = loss_dict[key].float().sum().item()
             is_nan = value == float('inf') or \
@@ -744,9 +807,27 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                               args.consumed_train_samples)
             writer.add_scalar('params-norm/params-norm vs tokens', params_norm,
                               args.consumed_train_tokens)
-        if args.curriculum_learning:
-            writer.add_scalar('curriculum_seqlen', args.curriculum_seqlen,
+        if hasattr(args, 'actual_seq_length'):
+            writer.add_scalar('seqlen/actual_seq_length', args.actual_seq_length,
                               iteration)
+            writer.add_scalar('seqlen/actual_seq_length vs samples', args.actual_seq_length,
+                              args.consumed_train_samples)
+            writer.add_scalar('seqlen/actual_seq_length vs tokens', args.actual_seq_length,
+                              args.consumed_train_tokens)
+        if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
+            writer.add_scalar('seqlen/curriculum_seqlen', args.curriculum_seqlen,
+                              iteration)
+            writer.add_scalar('seqlen/curriculum_seqlen vs samples', args.curriculum_seqlen,
+                              args.consumed_train_samples)
+            writer.add_scalar('seqlen/curriculum_seqlen vs tokens', args.curriculum_seqlen,
+                              args.consumed_train_tokens)
+        if args.random_ltd:
+            writer.add_scalar('seqlen/random_ltd_reserved_length', args.random_ltd_reserved_length,
+                              iteration)
+            writer.add_scalar('seqlen/random_ltd_reserved_length vs samples', args.random_ltd_reserved_length,
+                              args.consumed_train_samples)
+            writer.add_scalar('seqlen/random_ltd_reserved_length vs tokens', args.random_ltd_reserved_length,
+                              args.consumed_train_tokens)
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration,
                          normalizer=total_iterations)
@@ -774,23 +855,23 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             # print('step {} rank {} before sync opt_stats {}, {}'.format(iteration, torch.distributed.get_rank(), opt_stats_2, opt_stats))
             if args.zero_stage > 0:
                 # ZeRO partiions optimizer states
-                opt_stats = torch.cuda.FloatTensor(opt_stats)
+                opt_stats = get_accelerator().FloatTensor(opt_stats)
                 torch.distributed.all_reduce(opt_stats, group=mpu.get_data_parallel_group())
-                opt_stats_2 = torch.cuda.FloatTensor(opt_stats_2)
+                opt_stats_2 = get_accelerator().FloatTensor(opt_stats_2)
                 torch.distributed.all_reduce(opt_stats_2, op=torch.distributed.ReduceOp.MAX,
                     group=mpu.get_data_parallel_group())
 
             if args.tensor_model_parallel_size > 1:
-                opt_stats = torch.cuda.FloatTensor(opt_stats)
+                opt_stats = get_accelerator().FloatTensor(opt_stats)
                 torch.distributed.all_reduce(opt_stats, group=mpu.get_tensor_model_parallel_group())
-                opt_stats_2 = torch.cuda.FloatTensor(opt_stats_2)
+                opt_stats_2 = get_accelerator().FloatTensor(opt_stats_2)
                 torch.distributed.all_reduce(opt_stats_2, op=torch.distributed.ReduceOp.MAX,
                     group=mpu.get_tensor_model_parallel_group())
 
             if args.pipeline_model_parallel_size > 1:
-                opt_stats = torch.cuda.FloatTensor(opt_stats)
+                opt_stats = get_accelerator().FloatTensor(opt_stats)
                 torch.distributed.all_reduce(opt_stats, group=mpu.get_pipeline_model_parallel_group())
-                opt_stats_2 = torch.cuda.FloatTensor(opt_stats_2)
+                opt_stats_2 = get_accelerator().FloatTensor(opt_stats_2)
                 torch.distributed.all_reduce(opt_stats_2, op=torch.distributed.ReduceOp.MAX,
                     group=mpu.get_pipeline_model_parallel_group())
 
@@ -825,7 +906,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed()
         elapsed_time_per_iteration = elapsed_time / total_iterations
-        seq_len = args.curriculum_seqlen if args.curriculum_learning else args.seq_length
+        seq_len = args.seq_length
+        if hasattr(args, 'actual_seq_length'):
+            seq_len = args.actual_seq_length
         hidden_size = args.hidden_size
         num_layers = args.num_layers
         vocab_size = args.padded_vocab_size
@@ -863,16 +946,20 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                       float(max(1, total_loss_dict[advanced_iters_key]))
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
-                total_loss_dict[key] = torch.cuda.FloatTensor([0.0])
-        log_string += ' loss scale: {:.1f} |'.format(loss_scale)
+                total_loss_dict[key] = get_accelerator().FloatTensor([0.0])
+        if loss_scale is not None:
+            log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
         if num_zeros_in_grad is not None:
             log_string += ' num zeros: {:.1f} |'.format(num_zeros_in_grad)
         if params_norm is not None:
             log_string += ' params norm: {:.3f} |'.format(params_norm)
-        if args.curriculum_learning:
+        if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
             log_string += ' curriculum seqlen: {:5d} |'.format(args.curriculum_seqlen)
+        if args.random_ltd:
+            log_string += ' random ltd reserved length: {:5d} |'.format(args.random_ltd_reserved_length)
+        log_string += ' actual seqlen: {:5d} |'.format(seq_len)
         log_string += ' number of skipped iterations: {:3d} |'.format(
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
@@ -915,6 +1002,11 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     # Write args to tensorboard
     write_args_to_tensorboard()
 
+    if args.random_ltd:
+        # random-ltd requires different randomness on each rank
+        import random
+        random.seed(args.seed + torch.distributed.get_rank())
+
     # Turn on training mode which enables dropout.
     for model_module in model:
         model_module.train()
@@ -928,6 +1020,10 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     timers('interval-time').start()
     print_datetime('before the start of training step')
     report_memory_flag = True
+    if args.random_ltd:
+        assert model[0].random_ltd_enabled()
+        args.random_ltd_layer_num = model[0].random_ltd_scheduler.get_random_ltd_layer_num()
+        
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
         update_num_microbatches(args.consumed_train_samples)
@@ -938,7 +1034,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                 get_num_microbatches()
             model[0].set_train_batch_size(global_batch_size)
 
-        if args.curriculum_learning and not args.no_pipeline_parallel:
+        if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
             args.curriculum_seqlen = args.curriculum_scheduler.update_difficulty( \
                     args.iteration + 1)
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
@@ -953,17 +1049,31 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                        args.micro_batch_size * \
                                        get_num_microbatches()
         args.consumed_train_samples += new_samples
-        if not args.custom_token_counting:
-            # Models like BERT have padding thus need special token counting.
-            # See example in ../../pretrain_bert.py.
-            if args.curriculum_learning:
-                args.consumed_train_tokens += new_samples * args.curriculum_seqlen
+        # This actual_seq_length is used for actual consumed tokens calculation, flops calculation, and logging.
+        args.actual_seq_length = args.seq_length
+        if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
+            args.actual_seq_length = args.curriculum_seqlen
+        if args.random_ltd:
+            args.random_ltd_reserved_length = model[0].random_ltd_scheduler.get_current_seq()
+            if args.random_ltd_reserved_length < args.actual_seq_length:
+                args.actual_seq_length = (args.actual_seq_length * (args.num_layers - args.random_ltd_layer_num) + args.random_ltd_reserved_length * args.random_ltd_layer_num) // args.num_layers
+        if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
+            if hasattr(args, 'data_efficiency_curriculum_learning_numel'):
+                act_mbsz = args.data_efficiency_curriculum_learning_numel / args.curriculum_seqlen
+                act_token = act_mbsz * args.actual_seq_length
+                args.consumed_train_tokens += mpu.get_data_parallel_world_size() * \
+                        get_num_microbatches() * act_token
             else:
-                args.consumed_train_tokens += new_samples * args.seq_length
-
+                args.consumed_train_tokens += new_samples * args.actual_seq_length
+        else:
+            args.consumed_train_tokens += new_samples * args.actual_seq_length
+        
         # Logging.
         if args.deepspeed:
-            loss_scale = model[0].optimizer.cur_scale
+            if hasattr(model[0].optimizer, 'cur_scale'):
+                loss_scale = model[0].optimizer.cur_scale
+            else:
+                loss_scale = None
         else:
             loss_scale = optimizer.get_loss_scale().item()
         params_norm = None
@@ -998,10 +1108,61 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                      lr_scheduler)
             saved_checkpoint = True
 
+        # SCR: Write a defensive checkpoint every --scr-interval iterations (optional).
+        # SCR may discard such checkpoints if there is no failure.
+        # When using cache, like /dev/shm, these checkpoints
+        # may never be transferred to the parallel file system.
+        # This enables one to save checkpoints more frequently than
+        # one would otherwise if all checkpoints must be written to
+        # the (slower) parallel file system.
+        #
+        # Example usage:
+        #   --scr
+        #   --scr-interval=100
+        #   --save-interval=1000
+        if args.save and args.scr and args.scr_interval and \
+            iteration % args.scr_interval == 0:
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         lr_scheduler)
+                saved_checkpoint = True
+
+        # SCR: Write a defensive checkpoint if SCR recommends doing so (optional)
+        # If activated, scr.need_checkpoint() returns True in various
+        # conditions depending on how the user has configured SCR.
+        #
+        # Example usage:
+        #   --scr
+        #   --scr-seconds=600   # write chceckpoint every 600 seconds
+        #   --scr-overhead=5.0  # keep checkpoint overhead below 5% of runtime
+        if args.save and args.scr and scr.need_checkpoint():
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         lr_scheduler)
+                saved_checkpoint = True
+
+        # SCR: Write checkpiont and exit the run if SCR recommends doing so (optional).
+        # If activated, scr.should_exit() returns True depending on different
+        # conditions.  For supported resource managers, like SLURM, SCR
+        # can detect the time remaining within a job allocation and indicate
+        # to the application that it should exit when it is close to its time limit.
+        # One should also set SCR_HALT_SECONDS to inform SCR how much time is required
+        # to flush any cached checkpoint to the file system before the allocation ends.
+        # This can also react to external commands from the user, like an scr_halt command.
+        #
+        if args.save and args.scr and scr.should_exit():
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         lr_scheduler)
+            torch.distributed.barrier()
+            print_datetime('exiting program due to scr.should_exit at iteration {}'.format(iteration))
+            scr.finalize()
+            sys.exit()
+
         # Exiting based on duration
         if args.exit_duration_in_mins:
             train_time = (time.time() - _TRAIN_START_TIME) / 60.0
-            done_cuda = torch.cuda.IntTensor(
+            done_cuda = get_accelerator().IntTensor(
                 [train_time > args.exit_duration_in_mins])
             torch.distributed.all_reduce(
                 done_cuda, op=torch.distributed.ReduceOp.MAX)
@@ -1011,6 +1172,11 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              lr_scheduler)
                 print_datetime('exiting program after {} minutes'.format(train_time))
+
+                # SCR: flush any cached checkpoint
+                if args.scr:
+                    scr.finalize()
+
                 sys.exit()
 
         # Exiting based on iterations
@@ -1020,6 +1186,11 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                          lr_scheduler)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
+
+            # SCR: flush any cached checkpoint
+            if args.scr:
+                scr.finalize()
+
             sys.exit()
 
 
@@ -1034,7 +1205,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
     for model_module in model:
         model_module.eval()
 
-    if args.curriculum_learning and not args.no_pipeline_parallel:
+    if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
         # When curriculum learning is used with pipeline parallelism, we need
         # this logic to ensure that the eval data is not truncated. If there
         # is a seqlen change due to that, we need to call
@@ -1078,7 +1249,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                     for key in loss_dict:
                         if 'moe' not in key:
                             total_loss_dict[key] = total_loss_dict.get(
-                                key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
+                                key, get_accelerator().FloatTensor([0.0])) + loss_dict[key]
 
             args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
                                            * args.micro_batch_size \
@@ -1090,7 +1261,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
     for key in total_loss_dict:
         total_loss_dict[key] /= args.eval_iters * get_num_microbatches()
 
-    if args.curriculum_learning and not args.no_pipeline_parallel:
+    if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
         # roll back to actual curriculum seqlen at the end of eval.
         args.curriculum_seqlen = args.curriculum_scheduler.update_difficulty( \
             args.iteration + 1)
@@ -1168,6 +1339,7 @@ def build_train_valid_test_data_iterators(
         # Number of train/valid/test samples.
         if args.train_samples:
             train_samples = args.train_samples
+            update_train_iters(args)
         else:
             train_samples = args.train_iters * args.global_batch_size
         eval_iters = (args.train_iters // args.eval_interval + 1) * \
@@ -1197,10 +1369,10 @@ def build_train_valid_test_data_iterators(
         do_valid = valid_dataloader is not None and args.eval_iters > 0
         do_test = test_dataloader is not None and args.eval_iters > 0
         # Need to broadcast num_tokens and num_type_tokens.
-        flags = torch.cuda.LongTensor(
+        flags = get_accelerator().LongTensor(
             [int(do_train), int(do_valid), int(do_test)])
     else:
-        flags = torch.cuda.LongTensor([0, 0, 0])
+        flags = get_accelerator().LongTensor([0, 0, 0])
 
     # Broadcast num tokens.
     torch.distributed.broadcast(flags,

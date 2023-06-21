@@ -21,7 +21,6 @@ import time
 
 import numpy as np
 import torch
-
 from megatron import fused_kernels
 from megatron import get_adlr_autoresume
 from megatron import get_args
@@ -30,7 +29,7 @@ from megatron import mpu
 from megatron.global_vars import set_global_variables
 from megatron.mpu import (set_tensor_model_parallel_rank,
                           set_tensor_model_parallel_world_size)
-
+from deepspeed.accelerator import get_accelerator
 import deepspeed
 import deepspeed.utils.groups as groups
 
@@ -46,7 +45,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     """
     if not allow_no_cuda:
         # Make sure cuda is available.
-        assert torch.cuda.is_available(), 'Megatron requires CUDA.'
+        assert get_accelerator().is_available(), 'Megatron requires accelerator.'
 
     # Parse args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
@@ -66,6 +65,51 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         _set_random_seed(args.seed)
 
     args = get_args()
+
+    # SCR: configure and initialize SCR based on user options
+    if args.scr:
+        # SCR only supports a single directory for save/load.
+        if args.save != args.load:
+            raise ValueError(f"--save {args.save} must match --load {args.load} when using SCR")
+
+        # Configure SCR to use the save/load dir specified by the user.
+        # If not specified, SCR defaults to use the current working dir
+        # at the time scr.init() is called.
+        if args.save is not None:
+            scr.config(f"SCR_PREFIX={args.save}")
+        elif args.load is not None:
+            scr.config(f"SCR_PREFIX={args.load}")
+
+        # DeepSpeed expects files to be on the global file system during restart.
+        # Configure SCR to flush any cached checkpoint to the file system during scr.init().
+        scr.config("SCR_GLOBAL_RESTART=1")
+
+        # Attempt to load a specific checkpoint if the user requested one.
+        # This should match the name that was given to SCR, which is the checkpoint tag.
+        # For example, to restart from global_step200
+        #   --scr-current=global_step200
+        if args.scr_current is not None:
+            scr.config(f"SCR_CURRENT={args.scr_current}")
+
+        # Configure seconds between checkpoints if user provided a limit.
+        # If enabled, SCR will advise the application to save a checkpoint after
+        # this time via scr.need_checkpoint().
+        # For example, to write a checkpoint every 5 minutes:
+        #   --scr-seconds=300
+        if args.scr_seconds is not None:
+            scr.config(f"SCR_CHECKPOINT_SECONDS={args.scr_seconds}")
+
+        # Configure max percentage of runtime for checkpointing if user provided a limit.
+        # If enabled, SCR will advise the application to save a checkpoint as often
+        # as possible with the constraint that the total percent of runtime spent
+        # doing checkpointing remains below this limit.
+        # For example, to limit time spent checkpointing to 5% of runtime:
+        #   --scr-overhead=5.0
+        if args.scr_overhead is not None:
+            scr.config(f"SCR_CHECKPOINT_OVERHEAD={args.scr_overhead}")
+
+        scr.init()
+
     if  args.lazy_mpu_init:
         args.use_cpu_initialization=True
         # delayed initialization of DDP-related stuff
@@ -91,6 +135,9 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # No continuation function
         return None
 
+from mpi4py import MPI
+import scr
+
 
 def _compile_dependencies():
 
@@ -107,7 +154,10 @@ def _compile_dependencies():
         compile_helper()
         print('>>> done with dataset index builder. Compilation time: {:.3f} '
               'seconds'.format(time.time() - start_time), flush=True)
-
+        
+    if not get_accelerator().device_name() == 'cuda':
+        print(">fused kernel is only supported in cuda, skip loading fused kernel")
+        return 
     # ==================
     # Load fused kernels
     # ==================
@@ -134,7 +184,8 @@ def _compile_dependencies():
     if _is_rank_0():
         start_time = time.time()
         print('> compiling and loading fused kernels ...', flush=True)
-        fused_kernels.load(args)
+        if get_accelerator().device_count() > 0: # Skip when CPU-only
+            fused_kernels.load(args)
         torch.distributed.barrier()
     else:
         torch.distributed.barrier()
@@ -184,7 +235,7 @@ def setup_deepspeed_random_and_activation_checkpointing(args):
 def _initialize_distributed():
     """Initialize torch.distributed and mpu."""
     args = get_args()
-    device_count = torch.cuda.device_count()
+    device_count = get_accelerator().device_count()
     if torch.distributed.is_initialized():
 
         if args.rank == 0:
@@ -205,10 +256,11 @@ def _initialize_distributed():
             else:
                 args.local_rank = device
 
-        torch.cuda.set_device(device) 
+            get_accelerator().set_device(device) # only do so when device_count > 0
 
         # Call the init process
-        init_method = 'tcp://'
+        #init_method = 'tcp://'
+        init_method = 'env://'
         master_ip = os.getenv('MASTER_ADDR', 'localhost')
         master_port = os.getenv('MASTER_PORT', '6000')
         init_method += master_ip + ':' + master_port
@@ -247,11 +299,15 @@ def _set_random_seed(seed_):
     """Set random seed for reproducability."""
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
-        seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
+        # No need to do so for CPU-only case.
+        if get_accelerator().device_count() == 0:
+            seed = seed_
+        else:
+            seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        if torch.cuda.device_count() > 0:
+        if get_accelerator().device_count() > 0:
             mpu.model_parallel_cuda_manual_seed(seed)
     else:
         raise ValueError('Seed ({}) should be a positive integer.'.format(seed))
@@ -279,7 +335,7 @@ def _is_rank_0():
     """Check whether it is rank 0. For AML, check if it is rank 0 of a node"""
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0 or (
-            'AZUREML_EXPERIMENT_ID' in os.environ and torch.distributed.get_rank() % torch.cuda.device_count() == 0
+            'AZUREML_EXPERIMENT_ID' in os.environ and torch.distributed.get_rank() % get_accelerator().device_count() == 0
             ):
             return True
         else:

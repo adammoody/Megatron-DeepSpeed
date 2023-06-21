@@ -19,7 +19,7 @@ import os
 import random
 import sys
 import numpy as np
-
+from deepspeed.accelerator import get_accelerator
 import torch
 
 from megatron import (get_args,
@@ -119,6 +119,10 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
         iteration, args.save))
 
+    # SCR: the call to start output lives in DeepSpeed right now
+    #if args.scr:
+    #    scr.start_output(checkpoint_name, scr.FLAG_CHECKPOINT)
+
     if not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0 \
         or args.deepspeed:
 
@@ -137,7 +141,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
                 for i in range(len(model)):
                     mpu.set_virtual_pipeline_model_parallel_rank(i)
                     state_dict['model%d' % i] = model[i].state_dict_for_save_checkpoint()
-            
+
             # Optimizer stuff.
             if not args.no_save_optim:
                 if optimizer is not None:
@@ -150,7 +154,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
             state_dict['random_rng_state'] = random.getstate()
             state_dict['np_rng_state'] = np.random.get_state()
             state_dict['torch_rng_state'] = torch.get_rng_state()
-            state_dict['cuda_rng_state'] = torch.cuda.get_rng_state()
+            state_dict['cuda_rng_state'] = get_accelerator().get_rng_state()
             state_dict['rng_tracker_states'] \
                 = mpu.get_cuda_rng_tracker().get_states()
 
@@ -169,7 +173,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
 
         # Saving is a collective communication
         checkpoint_name = get_checkpoint_name(args.save, iteration)
-        
+
         # Trim off the filename and mp_rank_* directory.
         for _ in range(3):
             checkpoint_name = os.path.dirname(checkpoint_name)
@@ -201,7 +205,8 @@ def _transpose_first_dim(t, num_splits, num_splits_first, model):
     # specific to self attention so should work for cross attention as well
     while hasattr(model, 'module'):
         model = model.module
-    attention_module = model.language_model.encoder.layers[0].self_attention
+    #attention_module = model.language_model.encoder.layers[0].self_attention
+    attention_module = model.language_model.encoder.layers[0].attention
     hidden_size_per_attention_head = attention_module.hidden_size_per_attention_head
     num_attention_heads_per_partition = attention_module.num_attention_heads_per_partition
     if num_splits_first:
@@ -416,7 +421,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
             random.setstate(state_dict['random_rng_state'])
             np.random.set_state(state_dict['np_rng_state'])
             torch.set_rng_state(state_dict['torch_rng_state'])
-            torch.cuda.set_rng_state(state_dict['cuda_rng_state'])
+            get_accelerator().set_rng_state(state_dict['cuda_rng_state'])
             # Check for empty states array
             if not state_dict['rng_tracker_states']:
                 raise KeyError
@@ -442,7 +447,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
 def load_biencoder_checkpoint(model, only_query_model=False,
         only_context_model=False, custom_load_path=None):
     """
-    selectively load retrieval models for indexing/retrieving 
+    selectively load retrieval models for indexing/retrieving
     from saved checkpoints
     """
 
