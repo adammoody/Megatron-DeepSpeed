@@ -66,30 +66,45 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
 
     args = get_args()
 
-    # SCR: point SCR_PREFIX to checkpoint path
+    # SCR: configure and initialize SCR based on user options
     if args.scr:
-        # SCR only supports a single directory to both read previous checkpoints and to write new checkpoints
+        # SCR only supports a single directory for save/load.
         if args.save != args.load:
             raise ValueError(f"--save {args.save} must match --load {args.load} when using SCR")
 
-        # SCR will default to use the current working dir if args.save not specified
+        # Configure SCR to use the save/load dir specified by the user.
+        # If not specified, SCR defaults to use the current working dir
+        # at the time scr.init() is called.
         if args.save is not None:
             scr.config(f"SCR_PREFIX={args.save}")
+        elif args.load is not None:
+            scr.config(f"SCR_PREFIX={args.load}")
 
-        # DeepSpeed expects files to be on global file system
-        # This will flush any cached checkpoint to the file system on restart
+        # DeepSpeed expects files to be on the global file system during restart.
+        # Configure SCR to flush any cached checkpoint to the file system during scr.init().
         scr.config("SCR_GLOBAL_RESTART=1")
 
-        # Allow user to name a specific checkpoint to load.
+        # Attempt to load a specific checkpoint if the user requested one.
         # This should match the name that was given to SCR, which is the checkpoint tag.
+        # For example, to restart from global_step200
+        #   --scr-current=global_step200
         if args.scr_current is not None:
             scr.config(f"SCR_CURRENT={args.scr_current}")
 
         # Configure seconds between checkpoints if user provided a limit.
+        # If enabled, SCR will advise the application to save a checkpoint after
+        # this time via scr.need_checkpoint().
+        # For example, to write a checkpoint every 5 minutes:
+        #   --scr-seconds=300
         if args.scr_seconds is not None:
             scr.config(f"SCR_CHECKPOINT_SECONDS={args.scr_seconds}")
 
         # Configure max percentage of runtime for checkpointing if user provided a limit.
+        # If enabled, SCR will advise the application to save a checkpoint as often
+        # as possible with the constraint that the total percent of runtime spent
+        # doing checkpointing remains below this limit.
+        # For example, to limit time spent checkpointing to 5% of runtime:
+        #   --scr-overhead=5.0
         if args.scr_overhead is not None:
             scr.config(f"SCR_CHECKPOINT_OVERHEAD={args.scr_overhead}")
 

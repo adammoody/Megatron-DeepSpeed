@@ -1146,6 +1146,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         # conditions.  For supported resource managers, like SLURM, SCR
         # can detect the time remaining within a job allocation and indicate
         # to the application that it should exit when it is close to its time limit.
+        # One should also set SCR_HALT_SECONDS to inform SCR how much time is required
+        # to flush any cached checkpoint to the file system before the allocation ends.
         # This can also react to external commands from the user, like an scr_halt command.
         #
         if args.save and args.scr and scr.should_exit():
