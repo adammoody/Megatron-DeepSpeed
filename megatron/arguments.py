@@ -568,6 +568,17 @@ def _add_retro_args(parser):
             "Retro args must be prefixed with '--retro-*', for consistent " \
             "styling. Please fix '%s'." % ", ".join(action.option_strings)
 
+    group.add_argument('--scr', action='store_true', default=None,
+                       help='Enable SCR for checkpointing.')
+    group.add_argument('--scr-interval', type=int, default=None,
+                       help='Number of iterations between defensive checkpoints.')
+    group.add_argument('--scr-seconds', type=float, default=None,
+                       help='Number of seconds between defensive checkpoints.')
+    group.add_argument('--scr-overhead', type=float, default=None,
+                       help='Maximum runtime percentage for defensive checkpoints.')
+    group.add_argument('--scr-current', type=str, default=None,
+                       help='Checkpoint tag to load, e.g., global_step128.')
+
     return parser
 
 

@@ -346,6 +346,13 @@ def git_ds_info():
 
 
 if __name__ == "__main__":
+    if 'OMPI_COMM_WORLD_RANK' in os.environ:
+        os.environ["RANK"] = os.environ['OMPI_COMM_WORLD_RANK']
+    if 'OMPI_COMM_WORLD_SIZE' in os.environ:
+        os.environ["WORLD_SIZE"] = os.environ['OMPI_COMM_WORLD_SIZE']
+    if 'OMPI_COMM_WORLD_LOCAL_RANK' in os.environ:
+        os.environ["LOCAL_RANK"] = os.environ['OMPI_COMM_WORLD_LOCAL_RANK']
+
     git_ds_info()
     pretrain(train_valid_test_datasets_provider,
              model_provider,

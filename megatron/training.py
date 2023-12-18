@@ -56,6 +56,8 @@ try:
 except (ImportError, ModuleNotFoundError):
     wandb = None
 
+# SCR: import scalable checkpoint/restart library
+import scr
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -253,8 +255,12 @@ def pretrain(train_valid_test_dataset_provider,
                                    test_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train, test=True)
-    return model
 
+    # SCR: flush any cached checkpoint
+    if args.scr:
+        scr.finalize()
+
+    return model
 
 def update_train_iters(args):
 
@@ -1258,6 +1264,57 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                      opt_param_scheduler)
             saved_checkpoint = True
 
+        # SCR: Write a defensive checkpoint every --scr-interval iterations (optional).
+        # SCR may discard such checkpoints if there is no failure.
+        # When using cache, like /dev/shm, these checkpoints
+        # may never be transferred to the parallel file system.
+        # This enables one to save checkpoints more frequently than
+        # one would otherwise if all checkpoints must be written to
+        # the (slower) parallel file system.
+        #
+        # Example usage:
+        #   --scr
+        #   --scr-interval=100
+        #   --save-interval=1000
+        if args.save and args.scr and args.scr_interval and \
+            iteration % args.scr_interval == 0:
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         opt_param_scheduler)
+                saved_checkpoint = True
+
+        # SCR: Write a defensive checkpoint if SCR recommends doing so (optional)
+        # If activated, scr.need_checkpoint() returns True in various
+        # conditions depending on how the user has configured SCR.
+        #
+        # Example usage:
+        #   --scr
+        #   --scr-seconds=600   # write chceckpoint every 600 seconds
+        #   --scr-overhead=5.0  # keep checkpoint overhead below 5% of runtime
+        if args.save and args.scr and scr.need_checkpoint():
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         opt_param_scheduler)
+                saved_checkpoint = True
+
+        # SCR: Write checkpiont and exit the run if SCR recommends doing so (optional).
+        # If activated, scr.should_exit() returns True depending on different
+        # conditions.  For supported resource managers, like SLURM, SCR
+        # can detect the time remaining within a job allocation and indicate
+        # to the application that it should exit when it is close to its time limit.
+        # One should also set SCR_HALT_SECONDS to inform SCR how much time is required
+        # to flush any cached checkpoint to the file system before the allocation ends.
+        # This can also react to external commands from the user, like an scr_halt command.
+        #
+        if args.save and args.scr and scr.should_exit():
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         opt_param_scheduler)
+            torch.distributed.barrier()
+            print_datetime('exiting program due to scr.should_exit at iteration {}'.format(iteration))
+            scr.finalize()
+            sys.exit()
+
         # Exiting based on duration
         if args.exit_duration_in_mins:
             train_time = (time.time() - _TRAIN_START_TIME) / 60.0
@@ -1271,6 +1328,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler)
                 print_datetime('exiting program after {} minutes'.format(train_time))
+
+                # SCR: flush any cached checkpoint
+                if args.scr:
+                    scr.finalize()
+
                 sys.exit()
 
         # Exiting based on iterations
@@ -1280,6 +1342,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                          opt_param_scheduler)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
+
+            # SCR: flush any cached checkpoint
+            if args.scr:
+                scr.finalize()
+
             sys.exit()
 
 

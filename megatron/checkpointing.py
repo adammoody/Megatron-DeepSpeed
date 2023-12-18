@@ -233,6 +233,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
         iteration, args.save))
 
+    # SCR: the call to start output lives in DeepSpeed right now
+    #if args.scr:
+    #    scr.start_output(checkpoint_name, scr.FLAG_CHECKPOINT)
+
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state()
 
